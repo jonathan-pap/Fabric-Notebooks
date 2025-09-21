@@ -1,0 +1,581 @@
+# ======================== FABRIC DEPLOY PIPELINE =========================
+# This pipeline automates deployment of Microsoft Fabric workspaces:
+#   - GlobalDataHouse (WS_GDH)
+#   - DD_HealthSafety (WS_DD_HealthSafety)
+#   - UC_CSRDManagement (WS_UC_CSRDManagement)
+#
+# Deployment runs in 3 environments: 
+#   DEV   → branch development 
+#   ACC   → branch acceptance
+#   PROD  → branch main
+#
+# The flow is sequential: DEV → ACC → PROD
+# The pipeline only runs when there are changes in specific folders.
+
+
+trigger:
+  branches: { include: [acceptance, main, development] }
+  paths:
+    include:
+      - WS_DD_HealthSafety/**
+      - WS_GDH/**
+      - WS_UC_CSRDManagement/**
+      - .deploy/**
+      - parameter.yml
+      - azure-pipelines.yml
+
+
+pr:
+  branches: { include: [acceptance,  development, main] }
+  paths:
+    include:
+      - WS_DD_HealthSafety/**
+      - WS_GDH/**
+      - WS_UC_CSRDManagement/**
+      - .deploy/**
+      - parameter.yml
+      - azure-pipelines.yml
+
+stages:
+# ============================== DETECT CHANGES ==============================
+# Goal: figure out (a) which environment we’re targeting based on the branch
+# and which workspace folders changed. Expose booleans so later stages decide to run or skip.
+
+- stage: Detect_Changes
+  displayName: "Detect changed workspace(s)"
+  jobs:
+  - job: detect
+    displayName: "Compute change flags"
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - checkout: self
+      fetchDepth: 0
+      persistCredentials: true
+
+# PowerShell script that:
+# 1. Detects the source branch (development / acceptance / main).
+ # 2. Maps the branch to the correct environment (DEV/ACC/PROD).
+# 3. Finds changed files compared to the previous commit or merge base.
+# 4. Sets output variables:
+#       target_env   -> DEV / ACC / PROD
+#       changed_dd_hs, changed_gdh, changed_uc -> true/false
+#
+# These outputs are used by later stages to decide if they should run.
+    - pwsh: |
+        $ErrorActionPreference = 'Stop'
+        git config --global --add safe.directory "$(Build.SourcesDirectory)"
+
+        $isPR = "$(Build.Reason)" -eq "PullRequest"
+        $target = if ($isPR) { "$(System.PullRequest.TargetBranch)" } else { "$(Build.SourceBranch)" }
+        if ($target.StartsWith("refs/heads/")) { $target = $target.Substring(11) }
+
+        if ($target -eq "development") {
+          $target_env = "DEV"
+        } elseif ($target -eq "acceptance") {
+          $target_env = "ACC"
+        } elseif ($target -in @("main")) {
+          $target_env = "PROD"
+        } else {
+          $target_env = ""
+        }
+
+        git fetch --no-tags origin +refs/heads/*:refs/remotes/origin/* --depth=50
+
+        if ($isPR) {
+          $base = git merge-base HEAD "origin/$target"
+          if ([string]::IsNullOrWhiteSpace($base)) { throw "merge-base not found vs origin/$target" }
+          $files = git diff --name-only "$base" HEAD
+        } else {
+          $base = git rev-parse HEAD^ 2>$null
+          if (-not $base) { $base = (git rev-list --max-parents=0 HEAD | Select-Object -First 1) }
+          $files = git diff --name-only "$base" HEAD
+        }
+
+        Write-Host "Target branch: $target"
+        Write-Host "Target env   : $target_env"
+        Write-Host "Changed files:`n$files"
+
+        $arr = ($files -split "`n") | Where-Object { $_ }
+
+        $dd  = ( ($arr | Where-Object { $_ -match '^WS_DD_HealthSafety/' }).Count -gt 0 ).ToString().ToLower()
+        $gdh = ( ($arr | Where-Object { $_ -match '^WS_GDH/' }).Count -gt 0 ).ToString().ToLower()
+        $uc  = ( ($arr | Where-Object { $_ -match '^WS_UC_CSRDManagement/' }).Count -gt 0 ).ToString().ToLower()
+
+        Write-Host "##vso[task.setvariable variable=target_env;isOutput=true]$target_env"
+        Write-Host "##vso[task.setvariable variable=changed_dd_hs;isOutput=true]$dd"
+        Write-Host "##vso[task.setvariable variable=changed_gdh;isOutput=true]$gdh"
+        Write-Host "##vso[task.setvariable variable=changed_uc;isOutput=true]$uc"
+
+        Write-Host "Flags -> env:$target_env dd:$dd gdh:$gdh uc:$uc"
+      name: setFlags
+
+# ================================ 1) WS_GDH ================================
+# Pattern repeated per env:
+# - Use output variables from Detect_Changes to conditionally run.
+# - Use variable group `vg-ws-gdh` for secrets/IDs:
+#     FABRIC_CLIENT_ID / FABRIC_CLIENT_SECRET / FABRIC_TENANT_ID
+#     DEV__GlobalDataHouse__WS_ID / ACC__... / PROD__...
+# - Install Python & deps, then run the deployment script for the selected workspace.
+
+
+# 1) WS_GDH (DEV) -------------- first in order
+- stage: GDH_DEV
+  displayName: "Deploy DEV (development) - WS_GDH"
+  dependsOn: Detect_Changes
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_gdh
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_gdh'] ]
+    - group: vg-ws-gdh # <-- Variable group with secrets & IDs for GDH
+    - name: repoSubdir
+      value: WS_GDH # Folder in repo to publish
+  condition: and(succeeded(), eq(variables['target_env'],'DEV'), eq(variables['changed_gdh'],'true'))
+  jobs:
+  - job: deploy_dev
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_gdh=$(changed_gdh)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_DA)"; $csec = "$(FABRIC_CLIENT_SECRET_DA)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_DA vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_DA vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_DA (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_DA (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python ".deploy/fabric_workspace_deployment.py" `
+          --client_id="$(FABRIC_CLIENT_ID_DA)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_DA)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(DEV__GlobalDataHouse__WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=DEV
+      displayName: "Publish SM then Report (DEV)"
+
+- stage: GDH_ACC
+  displayName: "Deploy ACC - WS_GDH"
+  dependsOn: GDH_DEV # Only run after DEV stage (even if skipped due to no changes)
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_gdh
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_gdh'] ]
+    - group: vg-ws-gdh
+    - name: repoSubdir
+      value: WS_GDH
+  condition: and(in(dependencies.GDH_DEV.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'ACC'),
+                 eq(variables['changed_gdh'],'true'))
+  jobs:
+  - job: deploy_acc
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_gdh=$(changed_gdh)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_DA)"; $csec = "$(FABRIC_CLIENT_SECRET_DA)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_DA vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_DA vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_DA (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_DA (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python .deploy/fabric_workspace_deployment.py `
+          --client_id="$(FABRIC_CLIENT_ID_DA)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_DA)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(ACC__GlobalDataHouse__WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=ACC
+      displayName: "Publish SM then Report (ACC)"
+
+- stage: GDH_PROD
+  displayName: "Deploy PROD - WS_GDH"
+  dependsOn: GDH_ACC
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_gdh
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_gdh'] ]
+    - group: vg-ws-gdh
+    - name: repoSubdir
+      value: WS_GDH
+  condition: and(in(dependencies.GDH_ACC.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'PROD'),
+                 eq(variables['changed_gdh'],'true'))
+  jobs:
+  - job: deploy_prod
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_gdh=$(changed_gdh)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_P)"; $csec = "$(FABRIC_CLIENT_SECRET_P)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_P vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_P vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_P (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_P (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python ".deploy/fabric_workspace_deployment.py" `
+          --client_id="$(FABRIC_CLIENT_ID_P)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_P)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(PROD__GlobalDataHouse__WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=PROD
+      displayName: "Publish SM then Report (PROD)"
+
+# =========================== 2) WS_DD_HealthSafety ==========================
+# - Uses variable group `vg-ws-dd-healthsafety` with:
+#     DEV_DD_HealthSafety_WS_ID / ACC_... / PROD_... + Fabric creds.
+# - Publishes error log artifact if something fails (helps troubleshooting).
+- stage: DD_DEV
+  displayName: "Deploy DEV (development) - WS_DD_HealthSafety"
+  dependsOn:
+    - GDH_DEV # Enforce GDH runs first (ordered rollout)
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_dd_hs
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_dd_hs'] ]
+    - group: vg-ws-dd-healthsafety
+    - name: repoSubdir
+      value: WS_DD_HealthSafety
+  condition: and(in(dependencies.GDH_DEV.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'DEV'),
+                 eq(variables['changed_dd_hs'],'true'))
+  jobs:
+  - job: deploy_dev
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_dd_hs=$(changed_dd_hs)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_DA)"; $csec = "$(FABRIC_CLIENT_SECRET_DA)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_DA vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_DA vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_DA (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_DA (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python ".deploy/fabric_workspace_deployment.py" `
+          --client_id="$(FABRIC_CLIENT_ID_DA)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_DA)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(DEV_DD_HealthSafety_WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=DEV
+      displayName: "Publish SM then Report (DEV)"
+    - task: PublishBuildArtifacts@1
+      condition: failed()
+      continueOnError: true
+      inputs:
+        pathToPublish: '$(Build.SourcesDirectory)/fabric_cicd.error.log'
+        artifactName: fabric_cicd_logs
+        publishLocation: 'Container'
+
+- stage: DD_ACC
+  displayName: "Deploy ACC - WS_DD_HealthSafety"
+  dependsOn: DD_DEV
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_dd_hs
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_dd_hs'] ]
+    - group: vg-ws-dd-healthsafety
+    - name: repoSubdir
+      value: WS_DD_HealthSafety
+  condition: and(in(dependencies.DD_DEV.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'ACC'),
+                 eq(variables['changed_dd_hs'],'true'))
+  jobs:
+  - job: deploy_acc
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_dd_hs=$(changed_dd_hs)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_DA)"; $csec = "$(FABRIC_CLIENT_SECRET_DA)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_DA vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_DA vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_DA (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_DA (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python .deploy/fabric_workspace_deployment.py `
+          --client_id="$(FABRIC_CLIENT_ID_DA)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_DA)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(ACC_DD_HealthSafety_WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=ACC
+      displayName: "Publish SM then Report (ACC)"
+    - task: PublishBuildArtifacts@1
+      condition: failed()
+      continueOnError: true
+      inputs:
+        pathToPublish: '$(Build.SourcesDirectory)/fabric_cicd.error.log'
+        artifactName: fabric_cicd_logs
+        publishLocation: 'Container'
+
+- stage: DD_PROD
+  displayName: "Deploy PROD - WS_DD_HealthSafety"
+  dependsOn: DD_ACC
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_dd_hs
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_dd_hs'] ]
+    - group: vg-ws-dd-healthsafety
+    - name: repoSubdir
+      value: WS_DD_HealthSafety
+  condition: and(in(dependencies.DD_ACC.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'PROD'),
+                 eq(variables['changed_dd_hs'],'true'))
+  jobs:
+  - job: deploy_prod
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_dd_hs=$(changed_dd_hs)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_P)"; $csec = "$(FABRIC_CLIENT_SECRET_P)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_P vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_P vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_P (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_P (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python ".deploy/fabric_workspace_deployment.py" `
+          --client_id="$(FABRIC_CLIENT_ID_P)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_P)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(PROD__DD_HealthSafety_WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=PROD
+      displayName: "Publish SM then Report (PROD)"
+    - task: PublishBuildArtifacts@1
+      condition: failed()
+      continueOnError: true
+      inputs:
+        pathToPublish: '$(Build.SourcesDirectory)/fabric_cicd.error.log'
+        artifactName: fabric_cicd_logs
+        publishLocation: 'Container'
+
+# ============================ 3) WS_UC_CSRDManagement ======================
+# - Uses variable group `vg-ws-uc-csrd` with workspace IDs and Fabric creds.
+# - Depends on DD_DEV to keep an ordered rollout across workspaces.
+- stage: UC_DEV
+  displayName: "Deploy DEV (development) - WS_UC_CSRDManagement"
+  # Keep overall order: GDH -> DD -> UC
+  dependsOn: DD_DEV         
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_uc
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_uc'] ]
+    - group: vg-ws-uc-csrd
+    - name: repoSubdir
+      value: WS_UC_CSRDManagement
+  condition: and(in(dependencies.DD_DEV.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'DEV'),
+                 eq(variables['changed_uc'],'true'))
+  jobs:
+  - job: deploy_dev
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_uc=$(changed_uc)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_DA)"; $csec = "$(FABRIC_CLIENT_SECRET_DA)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_DA vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_DA vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_DA (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_DA (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python ".deploy/fabric_workspace_deployment.py" `
+          --client_id="$(FABRIC_CLIENT_ID_DA)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_DA)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(DEV__UC__CSRDManagement__WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=DEV
+      displayName: "Publish SM then Report (DEV)"
+
+- stage: UC_ACC
+  displayName: "Deploy ACC - WS_UC_CSRDManagement"
+  dependsOn: UC_DEV
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_uc
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_uc'] ]
+    - group: vg-ws-uc-csrd
+    - name: repoSubdir
+      value: WS_UC_CSRDManagement
+  condition: and(in(dependencies.UC_DEV.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'ACC'),
+                 eq(variables['changed_uc'],'true'))
+  jobs:
+  - job: deploy_acc
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_uc=$(changed_uc)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_DA)"; $csec = "$(FABRIC_CLIENT_SECRET_DA)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_DA vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_DA vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_DA (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_DA (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python .deploy/fabric_workspace_deployment.py `
+          --client_id="$(FABRIC_CLIENT_ID_DA)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_DA)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(ACC__UC__CSRDManagement__WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=ACC
+      displayName: "Publish SM then Report (ACC)"
+
+- stage: UC_PROD
+  displayName: "Deploy PROD - WS_UC_CSRDManagement"
+  dependsOn: UC_ACC
+  variables:
+    - name: target_env
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.target_env'] ]
+    - name: changed_uc
+      value: $[ stageDependencies.Detect_Changes.outputs['detect.setFlags.changed_uc'] ]
+    - group: vg-ws-uc-csrd
+    - name: repoSubdir
+      value: WS_UC_CSRDManagement
+  condition: and(in(dependencies.UC_ACC.result,'Succeeded','Skipped'),
+                 eq(variables['target_env'],'PROD'),
+                 eq(variables['changed_uc'],'true'))
+  jobs:
+  - job: deploy_prod
+    pool: { vmImage: 'windows-latest' }
+    steps:
+    - pwsh: |
+        Write-Host "target_env=$(target_env)"
+        Write-Host "changed_uc=$(changed_uc)"
+      displayName: "Debug vars"
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.12', addToPath: true }
+    - script: |
+        python -m pip install --upgrade pip
+        pip install fabric-cicd pyyaml
+      displayName: "Install deps"
+    - pwsh: |
+        $cid = "$(FABRIC_CLIENT_ID_P)"; $csec = "$(FABRIC_CLIENT_SECRET_P)"; $ten = "$(FABRIC_TENANT_ID)"
+        if (-not $cid)  { Write-Error "FABRIC_CLIENT_ID_P vazio";  exit 1 }
+        if (-not $csec) { Write-Error "FABRIC_CLIENT_SECRET_P vazio"; exit 1 }
+        if (-not $ten)  { Write-Error "FABRIC_TENANT_ID vazio";  exit 1 }
+        Write-Host "CLIENT_ID_P (first 5): "  + $cid.Substring(0,[Math]::Min(5,$cid.Length))
+        Write-Host "CLIENT_SECRET_P (first 5): " + $csec.Substring(0,[Math]::Min(5,$csec.Length))
+        Write-Host "TENANT_ID (first 5): " + $ten.Substring(0,[Math]::Min(5,$ten.Length))
+      displayName: "Sanity check"
+    - pwsh: |
+        python ".deploy/fabric_workspace_deployment.py" `
+          --client_id="$(FABRIC_CLIENT_ID_P)" `
+          --client_secret="$(FABRIC_CLIENT_SECRET_P)" `
+          --tenant_id="$(FABRIC_TENANT_ID)" `
+          --workspace_id="$(PROD__UC__CSRDManagement__WS_ID)" `
+          --repo_subdir="$(repoSubdir)" `
+          --env=PROD
+      displayName: "Publish SM then Report (PROD)"
