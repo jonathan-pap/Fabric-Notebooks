@@ -1,0 +1,25 @@
+find_replace: 
+
+  - find_value: ""
+    replace_value:
+      DEV: 
+      ACC: 
+      PROD: 
+    file_path:
+        - "**/Global_Data_House_LH_SQL.tmdl"
+
+  - find_value: ""
+    replace_value:
+      DEV: 
+      ACC: 
+      PROD: 
+    file_path:
+        - "**/Global_Data_House_Schema_RDM.tmdl"
+
+  - find_value: "powerbi://api.powerbi.com/v1.0/myorg/local-jpa-DD_HealthAndSafety__WS"
+    replace_value:
+      DEV: 
+      ACC: 
+      PROD: 
+    file_path:
+        - "**/expressions.tmdl"
